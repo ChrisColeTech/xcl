@@ -135,6 +135,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
         }
+        crate::hle::gameinput::shutdown_host_controller();
         crate::log::flush();
     }
     let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));

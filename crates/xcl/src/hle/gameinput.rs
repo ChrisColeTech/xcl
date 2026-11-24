@@ -3,7 +3,8 @@
 //! The title gets the console's GameInput interfaces (the public GameInput.h of the GDK, v0:
 //! IGameInput, IGameInputDevice, IGameInputReading as COM objects with the methods in that
 //! header's order) with one device: a gamepad that is always connected. A reading is the
-//! state at the moment it is asked for – the PC's first XInput controller, and the keyboard
+//! state at the moment it is asked for – the PC's first XInput controller, otherwise a Sony
+//! DualSense read through HID, and the keyboard
 //! while a window of this process has the focus (Enter / Space A, Escape / Backspace B,
 //! arrows the D-pad, Tab View, P Menu). Windows' own GameInput.dll is not used: its
 //! interfaces are not the console's and it reads only for a foreground app of its own.
@@ -213,6 +214,399 @@ fn xinput_pad() -> Option<GamepadState> {
     None
 }
 
+// ---------------------------------------------------------------------------------------
+// DualSense: raw HID fallback when no XInput slot answers
+// ---------------------------------------------------------------------------------------
+
+mod dualsense {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    };
+
+    const USB: u8 = 1;
+    const BT: u8 = 2;
+    const HID: GUID = GUID::from_u128(0x4d1e55b2_f16f_11cf_88cb_001111000030);
+
+    static STATE: Mutex<Option<GamepadState>> = Mutex::new(None);
+    static OUTPUT: Mutex<Option<Output>> = Mutex::new(None);
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+    static READ_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+    struct Output {
+        handle: HANDLE,
+        transport: u8,
+        sequence: u32,
+    }
+
+    unsafe impl Send for Output {}
+
+    impl Output {
+        fn rumble(&mut self, low: f32, high: f32) {
+            let level = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
+            let (packet, len) = output_report(self.transport, self.sequence, level(low), level(high));
+            self.sequence = self.sequence.wrapping_add(1);
+            let _ = write_bounded(self.handle, &packet[..len]);
+        }
+    }
+
+    impl Drop for Output {
+        fn drop(&mut self) {
+            self.rumble(0.0, 0.0);
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    #[link(name = "cfgmgr32")]
+    extern "system" {
+        fn CM_Get_Device_Interface_List_SizeW(len: *mut u32, guid: *const GUID, device: *const u16, flags: u32) -> u32;
+        fn CM_Get_Device_Interface_ListW(guid: *const GUID, device: *const u16, buf: *mut u16, len: u32, flags: u32) -> u32;
+    }
+
+    /// The first present DualSense/Edge HID interface and its transport.
+    fn find() -> Option<(Vec<u16>, u8)> {
+        let mut len = 0;
+        if unsafe { CM_Get_Device_Interface_List_SizeW(&mut len, &HID, std::ptr::null(), 0) } != 0 || len < 2 {
+            return None;
+        }
+        let mut paths = vec![0u16; len as usize];
+        if unsafe { CM_Get_Device_Interface_ListW(&HID, std::ptr::null(), paths.as_mut_ptr(), len, 0) } != 0 {
+            return None;
+        }
+        paths.split(|&c| c == 0).filter(|p| !p.is_empty()).find_map(|path| {
+            let transport = path_transport(&String::from_utf16_lossy(path))?;
+            Some((path.iter().copied().chain([0]).collect(), transport))
+        })
+    }
+
+    fn path_transport(path: &str) -> Option<u8> {
+        let p = path.to_ascii_lowercase();
+        let sony = p.contains("vid_054c") || p.contains("vid&0002054c");
+        let dualsense = p.contains("pid_0ce6") || p.contains("pid&0ce6") || p.contains("pid_0df2") || p.contains("pid&0df2");
+        let bluetooth = p.contains("{00001124-0000-1000-8000-00805f9b34fb}")
+            || p.contains("bthenum")
+            || p.contains("&col") && p.contains("bth");
+        (sony && dualsense).then_some(if bluetooth { BT } else { USB })
+    }
+
+    fn open(path: &[u16], access: u32) -> Option<HANDLE> {
+        let h = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                std::ptr::null_mut(),
+            )
+        };
+        (h != INVALID_HANDLE_VALUE).then_some(h)
+    }
+
+    fn stop_event() -> HANDLE {
+        static EVENT: OnceLock<usize> = OnceLock::new();
+        *EVENT.get_or_init(|| unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) as usize }) as HANDLE
+    }
+
+    fn read_report(h: HANDLE, event: HANDLE, buf: &mut [u8]) -> Option<usize> {
+        unsafe {
+            ResetEvent(event);
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.hEvent = event;
+            let mut n = 0;
+            if ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut n, &mut ov) == 0 && GetLastError() != ERROR_IO_PENDING {
+                return None;
+            }
+            if WaitForMultipleObjects(2, [event, stop_event()].as_ptr(), 0, 2000) != WAIT_OBJECT_0 {
+                CancelIoEx(h, &ov);
+                GetOverlappedResult(h, &ov, &mut n, 1);
+                return None;
+            }
+            (GetOverlappedResult(h, &ov, &mut n, 0) != 0).then_some(n as usize)
+        }
+    }
+
+    fn write_bounded(h: HANDLE, packet: &[u8]) -> bool {
+        unsafe {
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.hEvent = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            if ov.hEvent.is_null() {
+                return false;
+            }
+            let mut n = 0;
+            let mut ok = WriteFile(h, packet.as_ptr(), packet.len() as u32, &mut n, &mut ov) != 0;
+            if !ok && GetLastError() == ERROR_IO_PENDING {
+                if WaitForSingleObject(ov.hEvent, 30) == WAIT_OBJECT_0 {
+                    ok = GetOverlappedResult(h, &ov, &mut n, 0) != 0;
+                } else {
+                    CancelIoEx(h, &ov);
+                    GetOverlappedResult(h, &ov, &mut n, 1);
+                }
+            }
+            CloseHandle(ov.hEvent);
+            ok && n as usize == packet.len()
+        }
+    }
+
+    fn reader() {
+        crate::eh::arm_current_thread();
+        while !SHUTDOWN.load(Ordering::Acquire) {
+            if let Some((path, transport)) = find() {
+                read_device(&path, transport);
+            }
+            if !SHUTDOWN.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+
+    fn read_device(path: &[u16], transport: u8) {
+        let Some(input) = open(path, GENERIC_READ) else { return };
+        READ_HANDLE.store(input as usize, Ordering::Release);
+        let output = open(path, GENERIC_READ | GENERIC_WRITE).map(|handle| Output { handle, transport, sequence: 0 });
+        *OUTPUT.lock().unwrap_or_else(|e| e.into_inner()) = output;
+        crate::xlog_info!(
+            "GameInput: a DualSense ({}) is the title's gamepad when no XInput controller answers{}",
+            if transport == BT { "Bluetooth" } else { "USB" },
+            if OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).is_some() { ", with rumble" } else { "" }
+        );
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            *OUTPUT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            READ_HANDLE.store(0, Ordering::Release);
+            unsafe { CloseHandle(input) };
+            return;
+        }
+        let mut buf = [0u8; 128];
+        while !SHUTDOWN.load(Ordering::Acquire) {
+            let Some(n) = read_report(input, event, &mut buf) else { break };
+            if let Some(state) = parse_report(transport, &buf[..n]) {
+                *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+            }
+        }
+        *STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *OUTPUT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        READ_HANDLE.store(0, Ordering::Release);
+        unsafe {
+            CloseHandle(event);
+            CloseHandle(input);
+        }
+        if !SHUTDOWN.load(Ordering::Acquire) {
+            crate::xlog_info!("GameInput: the DualSense was disconnected");
+        }
+    }
+
+    pub fn pad() -> Option<GamepadState> {
+        if !STARTED.swap(true, Ordering::AcqRel) {
+            if let Err(e) = std::thread::Builder::new().name("xcl-dualsense".into()).spawn(reader) {
+                crate::xlog_warn!("GameInput: no DualSense reader thread: {e}");
+            }
+        }
+        *STATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn rumble(low: f32, high: f32) -> bool {
+        let mut output = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(output) = output.as_mut() {
+            output.rumble(low, high);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn shutdown() {
+        if SHUTDOWN.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        unsafe { SetEvent(stop_event()) };
+        let h = READ_HANDLE.load(Ordering::Acquire);
+        if h != 0 {
+            unsafe { CancelIoEx(h as HANDLE, std::ptr::null()) };
+        }
+        if let Ok(mut output) = OUTPUT.try_lock() {
+            *output = None;
+        }
+    }
+
+    fn axis(v: u8, invert: bool) -> f32 {
+        let a = v as i32 - 128;
+        let a = if a < 0 { a * 32767 / 128 } else { a * 32767 / 127 };
+        let a = if (-7000..7000).contains(&a) { 0 } else { a };
+        (if invert { -a } else { a }) as f32 / 32767.0
+    }
+
+    fn crc(seed: u8, packet: &[u8]) -> u32 {
+        let mut c = 0xffff_ffffu32;
+        for &b in std::iter::once(&seed).chain(packet) {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = (c >> 1) ^ (0u32.wrapping_sub(c & 1) & 0xedb8_8320);
+            }
+        }
+        !c
+    }
+
+    fn parse_report(transport: u8, report: &[u8]) -> Option<GamepadState> {
+        let (p, button_offset, full) = match transport {
+            USB if report.len() == 64 && report[0] == 1 => (&report[1..], 7, true),
+            BT if report.first() == Some(&1) && report.len() >= 10 => (&report[1..], 4, false),
+            BT if report.len() == 78 && report[0] == 0x31 => {
+                let expected = u32::from_le_bytes(report[74..78].try_into().ok()?);
+                if crc(0xa1, &report[..74]) != expected {
+                    return None;
+                }
+                (&report[2..], 7, true)
+            }
+            _ => return None,
+        };
+        let face = p[button_offset];
+        let extra = p[button_offset + 1];
+        const HAT: [u32; 8] = [
+            DPAD_UP,
+            DPAD_UP | DPAD_RIGHT,
+            DPAD_RIGHT,
+            DPAD_DOWN | DPAD_RIGHT,
+            DPAD_DOWN,
+            DPAD_DOWN | DPAD_LEFT,
+            DPAD_LEFT,
+            DPAD_UP | DPAD_LEFT,
+        ];
+        const BUTTONS: [(u8, u32); 8] = [
+            (0x10, X),
+            (0x20, A),
+            (0x40, B),
+            (0x80, Y),
+            (0x01, LEFT_SHOULDER),
+            (0x02, RIGHT_SHOULDER),
+            (0x40, LEFT_STICK),
+            (0x80, RIGHT_STICK),
+        ];
+        let mut buttons = HAT.get((face & 15) as usize).copied().unwrap_or(0);
+        for (i, &(mask, mapped)) in BUTTONS.iter().enumerate() {
+            let byte = if i < 4 { face } else { extra };
+            if byte & mask != 0 {
+                buttons |= mapped;
+            }
+        }
+        if extra & 0x10 != 0 {
+            buttons |= VIEW;
+        }
+        if extra & 0x20 != 0 {
+            buttons |= MENU;
+        }
+        let (left_trigger, right_trigger) = if full { (p[4], p[5]) } else { (p[7], p[8]) };
+        Some(GamepadState {
+            buttons,
+            left_trigger: left_trigger as f32 / 255.0,
+            right_trigger: right_trigger as f32 / 255.0,
+            left_x: axis(p[0], false),
+            left_y: axis(p[1], true),
+            right_x: axis(p[2], false),
+            right_y: axis(p[3], true),
+        })
+    }
+
+    fn output_report(transport: u8, sequence: u32, low: u8, high: u8) -> ([u8; 78], usize) {
+        let mut out = [0u8; 78];
+        let offset = if transport == BT { 3 } else { 1 };
+        out[0] = if transport == BT { 0x31 } else { 0x02 };
+        if transport == BT {
+            out[1] = ((sequence & 15) << 4) as u8;
+            out[2] = 0x10;
+        }
+        let p = &mut out[offset..];
+        p[0] = 3;
+        p[1] = 0x14;
+        p[2] = high;
+        p[3] = low;
+        p[38] = 4;
+        p[43] = 4;
+        p[45] = 40;
+        p[46] = 128;
+        if transport == BT {
+            let signature = crc(0xa2, &out[..74]);
+            out[74..78].copy_from_slice(&signature.to_le_bytes());
+            (out, 78)
+        } else {
+            (out, 48)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn usb_report_maps_xbox_buttons_axes_and_triggers() {
+            let mut report = [0u8; 64];
+            report[0] = 1;
+            report[1..7].copy_from_slice(&[0, 0, 255, 255, 255, 128]);
+            report[8] = 0x10 | 0x20 | 0x40 | 0x80 | 5;
+            report[9] = 0x01 | 0x02 | 0x10 | 0x20 | 0x40 | 0x80;
+            let state = parse_report(USB, &report).unwrap();
+            assert_eq!(state.buttons, A | B | X | Y | DPAD_DOWN | DPAD_LEFT | LEFT_SHOULDER | RIGHT_SHOULDER | VIEW | MENU | LEFT_STICK | RIGHT_STICK);
+            assert_eq!((state.left_x, state.left_y, state.right_x, state.right_y), (-1.0, 1.0, 1.0, -1.0));
+            assert_eq!(state.left_trigger, 1.0);
+            assert!((state.right_trigger - 128.0 / 255.0).abs() < 0.0001);
+            assert!(parse_report(USB, &report[..63]).is_none());
+            let (out, len) = output_report(USB, 0, 255, 128);
+            assert_eq!((len, out[0], out[3], out[4]), (48, 0x02, 128, 255));
+        }
+
+        #[test]
+        fn bluetooth_report_requires_crc_and_output_is_signed() {
+            let mut report = [0u8; 78];
+            report[0] = 0x31;
+            report[2..8].copy_from_slice(&[128, 128, 128, 128, 10, 20]);
+            report[9] = 8;
+            let signature = crc(0xa1, &report[..74]);
+            report[74..].copy_from_slice(&signature.to_le_bytes());
+            let state = parse_report(BT, &report).unwrap();
+            assert_eq!(state.buttons, 0);
+            assert_eq!((state.left_x, state.left_y), (0.0, 0.0));
+            assert_eq!((state.left_trigger, state.right_trigger), (10.0 / 255.0, 20.0 / 255.0));
+            report[74] ^= 1;
+            assert!(parse_report(BT, &report).is_none());
+
+            let (out, len) = output_report(BT, 3, 255, 128);
+            assert_eq!(len, 78);
+            assert_eq!((out[0], out[1], out[2], out[5], out[6]), (0x31, 0x30, 0x10, 128, 255));
+            assert_eq!(u32::from_le_bytes(out[74..].try_into().unwrap()), crc(0xa2, &out[..74]));
+        }
+
+        #[test]
+        fn dualsense_paths_select_usb_and_bluetooth() {
+            assert_eq!(path_transport(r"\\?\hid#vid_054c&pid_0ce6#1#{4d1e55b2-f16f-11cf-88cb-001111000030}"), Some(USB));
+            assert_eq!(path_transport(r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&0ce6#1"), Some(BT));
+            assert_eq!(path_transport(r"\\?\hid#vid_045e&pid_0b13#1"), None);
+        }
+    }
+}
+
+const BACKEND_NONE: u32 = 0;
+const BACKEND_XINPUT: u32 = 1;
+const BACKEND_DUALSENSE: u32 = 2;
+static ACTIVE_BACKEND: AtomicU32 = AtomicU32::new(BACKEND_NONE);
+
+pub(crate) fn shutdown_host_controller() {
+    dualsense::shutdown();
+}
+
 fn start() -> Instant {
     static T: OnceLock<Instant> = OnceLock::new();
     *T.get_or_init(Instant::now)
@@ -301,7 +695,20 @@ fn merge_host_inputs(
 
 /// the gamepad now
 pub fn poll() -> GamepadState {
-    let mut s = xinput_pad().unwrap_or_default();
+    let mut s = if let Some(state) = xinput_pad() {
+        if ACTIVE_BACKEND.swap(BACKEND_XINPUT, Ordering::AcqRel) == BACKEND_DUALSENSE {
+            dualsense::rumble(0.0, 0.0);
+        }
+        state
+    } else if let Some(state) = dualsense::pad() {
+        ACTIVE_BACKEND.store(BACKEND_DUALSENSE, Ordering::Release);
+        state
+    } else {
+        if ACTIVE_BACKEND.swap(BACKEND_NONE, Ordering::AcqRel) == BACKEND_DUALSENSE {
+            dualsense::rumble(0.0, 0.0);
+        }
+        GamepadState::default()
+    };
     merge_host_inputs(
         &mut s,
         super::kbm::enabled(),
@@ -586,10 +993,13 @@ unsafe extern "system" fn get_battery_state(_this: *mut Object, state: *mut [u32
 unsafe extern "system" fn motor_powered_on(_this: *mut Object, _motor: u32) -> bool {
     false
 }
-/// GameInputRumbleParams {low, high, left trigger, right trigger}: the XInput motors
+/// GameInputRumbleParams {low, high, left trigger, right trigger}: the active pad's motors.
 unsafe extern "system" fn set_rumble_state(_this: *mut Object, p: *const [f32; 4]) {
-    let Some((_, set)) = xinput() else { return };
     let (lo, hi) = if p.is_null() { (0.0, 0.0) } else { ((*p)[0], (*p)[1]) };
+    if ACTIVE_BACKEND.load(Ordering::Acquire) == BACKEND_DUALSENSE && dualsense::rumble(lo, hi) {
+        return;
+    }
+    let Some((_, set)) = xinput() else { return };
     let speed = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
     set(PAD.load(Ordering::Relaxed), &[speed(lo), speed(hi)]);
 }
@@ -990,7 +1400,7 @@ pub unsafe extern "system" fn GameInputCreate(out: *mut *mut c_void) -> HRESULT 
     }
     start();
     *out = input() as *mut c_void;
-    crate::xlog_info!("GameInput: GameInputCreate – one gamepad (XInput controller / keyboard)");
+    crate::xlog_info!("GameInput: GameInputCreate – one gamepad (XInput / DualSense / keyboard)");
     S_OK
 }
 

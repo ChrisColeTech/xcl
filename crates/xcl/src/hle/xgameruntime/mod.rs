@@ -156,6 +156,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XUserGetTokenAndSignatureUtf16Async,
         XUserGetTokenAndSignatureUtf16ResultSize,
         XUserGetTokenAndSignatureUtf16Result,
+        XUserRegisterForDeviceAssociationChanged,
+        XUserUnregisterForDeviceAssociationChanged,
         XUserFindForDevice,
         XUserFindControllerForUserWithUiAsync,
         XUserFindControllerForUserWithUiResult,
@@ -963,6 +965,13 @@ pub unsafe extern "system" fn XStoreCloseContextHandle(_h: *mut c_void) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_association_functions_are_exported_by_name() {
+        let names: Vec<_> = exports().into_iter().map(|(name, _)| name).collect();
+        assert!(names.contains(&"XUserRegisterForDeviceAssociationChanged"));
+        assert!(names.contains(&"XUserUnregisterForDeviceAssociationChanged"));
+    }
 
     #[test]
     fn feature_availability_covers_the_public_feature_enum() {
