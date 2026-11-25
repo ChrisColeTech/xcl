@@ -756,6 +756,119 @@ fn gpu_rndne_f64() {
 }
 
 #[test]
+fn gpu_frexp_exp_f32_denorm_modes() {
+    const CASES: [(u32, i32, i32); 13] = [
+        (0x0000_0001, -148, 0), (0x0000_0003, -147, 0), (0x007F_FFFF, -126, 0),
+        (0x0080_0000, -125, -125), (0x8000_0001, -148, 0), (0x0000_0000, 0, 0),
+        (0x8000_0000, 0, 0), (0x4060_0000, 2, 2), (0xC060_0000, 2, 2),
+        (0x7F7F_FFFF, 128, 128), (0x7F80_0000, 0, 0), (0xFF80_0000, 0, 0),
+        (0x7FC0_0000, 0, 0),
+    ];
+    let p = prog(&[
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 12)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 14)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 15)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (lane, v) in st.vgpr.iter_mut().enumerate() {
+        v[0] = CASES[lane % CASES.len()].0;
+        v[4..8].fill(u32::MAX);
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (lane, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (bits, preserve, flush) = CASES[lane % CASES.len()];
+            let got = [v[4] as i32, v[5] as i32, v[6] as i32, v[7] as i32];
+            assert_eq!(got, [flush, preserve, flush, preserve], "wave{lanes} lane {lane}: {bits:#010x}");
+        }
+    }
+}
+
+#[test]
+fn gpu_frexp_exp_f32_denorm_setreg() {
+    let p = prog(&[
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 12)], None),
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 3))], Some(4)),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 5, 1))], Some(0)),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V)], None),
+        ("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 4, 2)), ("SDST", 0)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V)], None),
+        ("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 4, 2)), ("SDST", 1)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[0] = 2;
+    st.sgpr[1] = 1;
+    for v in &mut st.vgpr {
+        v[0] = 1;
+        v[4..8].fill(u32::MAX);
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (lane, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let got = [v[4] as i32, v[5] as i32, v[6] as i32, v[7] as i32];
+            assert_eq!(got, [-148, -148, 0, -148], "wave{lanes} lane {lane}");
+        }
+    }
+}
+
+#[test]
+fn gpu_frexp_exp_f32_denorm_control_flow() {
+    let p = prog(&[
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 12)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    for v in &mut st.vgpr {
+        v[0] = 1;
+        v[4] = u32::MAX;
+    }
+    for wave64 in gpu_waves() {
+        for (s0, expected) in [(1, 0), (0, -148)] {
+            st.sgpr[0] = s0;
+            let (r, lanes) = run_wave(&p, &st, wave64);
+            for (lane, v) in r.vgpr.iter().take(lanes).enumerate() {
+                assert_eq!(v[4] as i32, expected, "wave{lanes} lane {lane}: s0={s0}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_frexp_exp_f32_denorm_initial_mode() {
+    let legacy = prog(&[("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None)]);
+    let conditional = prog(&[
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    let inputs = [0x0000_0001, 0x8000_0003, 0x007F_FFFF, 0x0080_0000, 0x8000_0000, 0x7FC0_0000];
+    for (lane, v) in st.vgpr.iter_mut().enumerate() {
+        v[0] = inputs[lane % inputs.len()];
+        v[4] = u32::MAX;
+    }
+    for wave64 in gpu_waves() {
+        let (expected, lanes) = run_wave(&legacy, &st, wave64);
+        let (actual, _) = run_wave(&conditional, &st, wave64);
+        for lane in 0..lanes {
+            assert_ne!(expected.vgpr[lane][4], u32::MAX, "wave{lanes} lane {lane}: unwritten reference");
+            assert_eq!(actual.vgpr[lane][4], expected.vgpr[lane][4], "wave{lanes} lane {lane}: initial MODE");
+        }
+    }
+}
+
+#[test]
 fn gpu_frexp_f64_exp_and_mant() {
     if !gpu_ready() {
         return;

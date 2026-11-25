@@ -173,6 +173,7 @@ pub struct Lw {
     /// the program writes a non-default MODE[1:0]: rounding f32 instructions round by
     /// `lower_round::VAR_F32_MODE` (`lower_round`)
     pub f32_rm: bool,
+    pub track_frexp_denorm: bool,
     pub has_f64_round_op: bool,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
@@ -909,7 +910,7 @@ impl Lw {
         if self.geom.is_some() && self.geom_inst(d, &name).is_some() {
             return Ok(());
         }
-        if name == "s_denorm_mode" && self.f32_rm {
+        if name == "s_denorm_mode" && (self.f32_rm || self.track_frexp_denorm) {
             return self.denorm_mode(Self::fv(d, "SIMM16") as u32);
         }
         if NOOPS.contains(&name.as_str()) {
@@ -1000,11 +1001,11 @@ impl Lw {
     fn setreg(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let simm = Self::fv(d, "SIMM16") as u16;
         let (sp_mask, dp_mask, off) = hwreg_mode_round_masks(simm);
-        if self.f32_rm {
+        if self.f32_rm || self.track_frexp_denorm {
             // the mirrored MODE bits (single-precision round / denormal modes)
             let (id, offset, width) = decode_hwreg(simm);
             if id == 1 {
-                let wmask = if width >= 32 { u32::MAX } else { ((1u32 << width) - 1) << offset };
+                let wmask = (if width == 32 { u32::MAX } else { (1u32 << width) - 1 }) << offset;
                 let src = if name == "s_setreg_imm32_b32" {
                     let imm = d.literal.ok_or_else(|| format!("{}: literal", rdna2::format(d)))?;
                     self.c(imm)
