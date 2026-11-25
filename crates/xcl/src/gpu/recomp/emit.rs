@@ -518,6 +518,7 @@ fn is_f16_rounded_op(name: &str) -> bool {
             | "v_max3_f16"
             | "v_frexp_mant_f16"
             | "v_mad_f16"
+            | "v_div_fixup_f16"
             | "v_fmac_f16"
             | "v_fmamk_f16"
             | "v_fmaak_f16"
@@ -3393,6 +3394,7 @@ impl Em {
             "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
+            "v_div_fixup_f16" => fr(format!("div_fixup({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_med3_u16" => format!("med3u({a}, {b}, {c})"),
@@ -4658,10 +4660,11 @@ impl Em {
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
         // memory coherent across the GPU there; graphics keeps the cached (faster) view
         let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
-        let windows = self.opt.mem_windows.clamp(1, 4);
+        let max_win = if self.opt.heap_windows { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
+        let windows = self.opt.mem_windows.clamp(1, max_win);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {
-            for k in 1..windows {
+            for k in 1..windows.min(crate::gpu::uma::MAX_WINDOWS as u32) {
                 let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
             }
             h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\n");
