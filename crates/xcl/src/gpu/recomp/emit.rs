@@ -3512,7 +3512,7 @@ impl Em {
                     "v_fma_f64" => format!("fma({}, {}, {})", f64v(0), f64v(1), f64v(2)),
                     "v_min_f64" => format!("min({}, {})", f64v(0), f64v(1)),
                     "v_max_f64" => format!("max({}, {})", f64v(0), f64v(1)),
-                    "v_rcp_f64" => format!("(1.0 / {})", f64v(0)),
+                    "v_rcp_f64" => format!("rcp_d({})", f64v(0)),
                     "v_cvt_f64_f32" => format!("(double)asfloat({})", lo_hi[0].0),
                     "v_cvt_f64_i32" => format!("(double)(int){}", lo_hi[0].0),
                     "v_cvt_f64_u32" => format!("(double){}", lo_hi[0].0),
@@ -3522,7 +3522,7 @@ impl Em {
                     "v_rndne_f64" => format!("round_ne_d({})", f64v(0)),
                     "v_frexp_mant_f64" => format!("frexp_mant_d({})", f64v(0)),
                     "v_sqrt_f64" => format!("sqrt_d({})", f64v(0)),
-                    "v_rsq_f64" => format!("((double)1 / sqrt_d({}))", f64v(0)),
+                    "v_rsq_f64" => format!("rcp_d(sqrt_d({}))", f64v(0)),
                     "v_trunc_f64" => format!("trunc_d({})", f64v(0)),
                     "v_ldexp_f64" => format!("ldexp_d({}, (int){})", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
@@ -5752,9 +5752,11 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         return uint4(id[0], id[1], id[2], id[3]);
     }
     if (type <= 3u) {
-        // GPURT gfx10 node: a pair of triangles, type 0 = (v0, v1, v2), type 1 = (v1, v3, v2)
-        bool t1 = type == 1u;
-        float3 v0 = asfloat(mem.Load3(at + (t1 ? 12u : 0u))), v1 = asfloat(mem.Load3(at + (t1 ? 36u : 12u))), v2 = asfloat(mem.Load3(at + 24u));
+        // GPURT gfx10 node: up to four triangles across 5 vertices: 0=(0,1,2), 1=(1,3,2), 2=(2,3,4), 3=(2,4,0)
+        uint o0 = type == 0u ? 0u : (type == 1u ? 12u : 24u);
+        uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
+        uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
+        float3 v0 = asfloat(mem.Load3(at + o0)), v1 = asfloat(mem.Load3(at + o1)), v2 = asfloat(mem.Load3(at + o2));
         float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
         float det = dot(e1, p);
         float3 sv = o - v0, q = cross(sv, e1);
@@ -6289,6 +6291,19 @@ double sqrt_d(double x) {
     y = y + (s - y * y) / (y + y);
     y = y + fma(-y, y, s) / (y + y);
     return ldexp_d(y, k);
+}
+// 1/x. DXC marks a plain divide fast (no NaN, no infinities), and a driver may then give 0 for
+// 1/NaN (RADV: v_rsq_f64 of a negative number was 0, not NaN). NaN, ±0 and ±inf are taken here.
+// The rest divides the mantissa (x scaled into [0.5, 1)), `precise`, and scales back with
+// ldexp_d, so a result below 2^-1022 is a denormal and not flushed to 0 (RADV: 1/DBL_MAX was 0).
+double rcp_d(double x) {
+    uint l, h; asuint(x, l, h);
+    if (isnan_d(x)) return x;
+    if (x == 0.0) return asdouble(0u, (h & 0x80000000u) | 0x7FF00000u);
+    if (isinf_d(x)) return asdouble(0u, h & 0x80000000u);
+    int e = frexp_exp_d(x);
+    precise double r = 1.0 / ldexp_d(x, -e);
+    return ldexp_d(r, -e);
 }
 // ±inf gives NaN, and NaN gives x
 double fract_d(double x) {

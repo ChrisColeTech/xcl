@@ -1009,12 +1009,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
             n @ ("S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ") => {
                 let v = self.read_bit(b, VCC)?;
-                let c = if self.wave_branches {
-                    self.mask_nonzero(v)
-                } else {
-                    let e = self.read_bit(b, EXEC)?;
-                    self.ir.bin(Bin::And, v, e)
-                };
+                let c = if self.wave_branches { self.mask_nonzero(v) } else { v };
                 if n == "S_CBRANCH_VCCZ" {
                     self.not(c)
                 } else {
