@@ -1045,7 +1045,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first)));
     if gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {
